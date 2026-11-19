@@ -1,0 +1,40 @@
+# Render Blueprint - backend only (frontend is on Vercel). Mongo is MongoDB Atlas.
+services:
+  - type: web
+    name: farooq-bot-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: starter            # must be a paid always-on plan: the scheduler runs 08:30-15:40 IST
+    region: singapore
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: TZ
+        value: Asia/Kolkata
+      - key: ADMIN_USERNAME
+        value: admin
+      - key: ADMIN_PASSWORD
+        sync: false           # set in dashboard
+      - key: JWT_SECRET
+        generateValue: true
+      - key: MONGO_URI
+        sync: false           # Atlas connection string
+      - key: MONGO_DB
+        value: farooq_bot
+      - key: ALLOW_MOCK_DB
+        value: "false"
+      - key: DATA_PROVIDER
+        value: yfinance
+      - key: ENABLE_SCHEDULER
+        value: "true"
+      - key: FRONTEND_URL
+        sync: false           # https://<your-app>.vercel.app
+      - key: CORS_ORIGINS
+        sync: false           # same Vercel URL (comma separated if more than one)
+      - key: UPSTOX_REDIRECT_URI
+        sync: false           # https://farooq-bot-api.onrender.com/api/broker/upstox/callback
+      - key: UPSTOX_API_KEY
+        sync: false
+      - key: UPSTOX_API_SECRET
+        sync: false

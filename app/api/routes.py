@@ -1,0 +1,381 @@
+"""REST API."""
+import asyncio
+from datetime import date, datetime, timedelta, timezone
+
+from bson import ObjectId
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
+
+from ..backtest.engine import run_backtest
+from ..config import get_settings
+from ..core.events import log_event
+from ..core.scheduler import jobs_info, reschedule_from_params
+from ..core.state import get_params, get_runtime, save_params, update_runtime
+from ..data.market_data import market_data, now_ist
+from ..db import clean, db
+from ..execution.brokers import BrokerError, PaperBroker, get_broker
+from ..execution.order_manager import order_manager, today_str
+from ..execution.tokens import clear_token, save_token, token_status
+from ..strategy.engine import engine, market_open_now
+from ..strategy.params import StrategyParams
+from .auth import current_user
+from .charts import build_chart
+
+api = APIRouter(prefix="/api", dependencies=[Depends(current_user)])
+public = APIRouter(prefix="/api")   # broker OAuth callbacks (browser redirects, no bearer header)
+
+
+# ============================================================================ status / session
+@api.get("/status")
+async def status():
+    from .. import db as dbmod
+    rt = await get_runtime()
+    return {"runtime": rt, "mock_db": dbmod.using_mock, "data_provider": market_data.provider.name,
+            "market_open": market_open_now(), "now_ist": now_ist().isoformat(), "engine": engine.status,
+            "jobs": jobs_info(),
+            "brokers": {b: await token_status(b) for b in ("upstox", "kite")}}
+
+
+@api.get("/session")
+async def session(date_: str | None = Query(None, alias="date")):
+    d = date_ or today_str()
+    s = await db().daily_sessions.find_one({"date": d})
+    filters = [clean(x) async for x in db().filter_states.find({"date": d})]
+    return {"date": d, "session": clean(s), "filters": filters, "ltp": engine.ltps}
+
+
+@api.get("/sessions")
+async def sessions(limit: int = 30):
+    cur = db().daily_sessions.find({}, {"buy_candidates": 1, "sell_candidates": 1, "date": 1, "regime": 1,
+                                        "nifty_change": 1, "eod_pnl": 1}).sort("date", -1).limit(limit)
+    return [clean(x) async for x in cur]
+
+
+@api.get("/filter-history")
+async def filter_history(symbol: str, date_: str | None = Query(None, alias="date")):
+    d = date_ or today_str()
+    return [clean(x) async for x in db().filter_history.find({"date": d, "symbol": symbol}).sort("ts", 1)]
+
+
+# ============================================================================ engine controls
+@api.post("/engine/scan")
+async def run_scan():
+    return clean(await engine.pre_market_scan())
+
+
+@api.post("/engine/regime")
+async def run_regime():
+    return clean(await engine.decide_regime())
+
+
+@api.post("/engine/evaluate")
+async def run_evaluate(include_inactive: bool = True):
+    # manual evaluation never places orders unless the market is open AND engine is enabled
+    return clean(await engine.evaluate_all(allow_orders=market_open_now(), include_inactive=include_inactive))
+
+
+@api.post("/engine/square-off")
+async def square_off():
+    return {"closed": await engine.square_off("Manual square-off")}
+
+
+@api.post("/engine/kill-switch")
+async def kill_switch():
+    await update_runtime(halted_date=today_str(), engine_enabled=False)
+    n = await engine.square_off("KILL SWITCH")
+    await log_event("warning", "engine", f"KILL SWITCH: closed {n}, auto-trading disabled")
+    return {"closed": n}
+
+
+@api.post("/engine/resume")
+async def resume():
+    await update_runtime(halted_date=None, engine_enabled=True)
+    await log_event("info", "engine", "Auto-trading resumed")
+    return await get_runtime()
+
+
+# ============================================================================ chart
+@api.get("/chart/{symbol}")
+async def chart(symbol: str, tf: str = "5m", side: str = "BUY"):
+    p = await get_params()
+    try:
+        return await build_chart(symbol, tf, side, p)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(400, f"{type(e).__name__}: {e}") from e
+
+
+# ============================================================================ account / trading
+@api.get("/account/summary")
+async def account_summary():
+    rt = await get_runtime()
+    out = {"mode": rt["mode"], "execution_broker": rt["broker"] if rt["mode"] == "live" else "paper",
+           "paper": await PaperBroker().funds(), "brokers": {}, "day_pnl": await order_manager.day_pnl()}
+    for b in ("upstox", "kite"):
+        st = await token_status(b)
+        if st["connected"]:
+            try:
+                f = await get_broker(b).funds()
+                f.pop("raw", None)
+                out["brokers"][b] = {"connected": True, **f}
+            except Exception as e:  # noqa: BLE001
+                out["brokers"][b] = {"connected": True, "error": str(e)}
+        else:
+            out["brokers"][b] = {"connected": False}
+    # all-time stats for the current mode
+    tot = n = w = 0
+    async for t in db().trades.find({"mode": rt["mode"]}, {"net_pnl": 1}):
+        tot += t["net_pnl"]
+        n += 1
+        w += t["net_pnl"] > 0
+    out["all_time"] = {"net_pnl": round(tot, 2), "trades": n, "win_rate": round(100 * w / n, 1) if n else None}
+    return out
+
+
+@api.get("/positions")
+async def positions(status: str = "OPEN"):
+    q = {} if status == "ALL" else {"status": status}
+    if status != "OPEN":
+        q["date"] = today_str()
+    return [clean(p) async for p in db().positions.find(q).sort("entry_time", -1)]
+
+
+@api.post("/positions/{pid}/exit")
+async def exit_position(pid: str):
+    pos = await db().positions.find_one({"_id": ObjectId(pid), "status": "OPEN"})
+    if not pos:
+        raise HTTPException(404, "Open position not found")
+    ltp = (await market_data.ltp([pos["symbol"]])).get(pos["symbol"]) or pos.get("ltp") or pos["entry_price"]
+    t = await order_manager.exit(pos, ltp, "Manual exit")
+    if not t:
+        raise HTTPException(500, "Exit failed — check logs")
+    return clean(t)
+
+
+@api.get("/broker/{name}/positions")
+async def broker_positions(name: str):
+    try:
+        return await get_broker(name).positions()
+    except BrokerError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@api.get("/trades")
+async def trades(from_: str | None = Query(None, alias="from"), to: str | None = None, mode: str | None = None,
+                 symbol: str | None = None, limit: int = 500):
+    q: dict = {}
+    if from_ or to:
+        q["date"] = {k: v for k, v in (("$gte", from_), ("$lte", to)) if v}
+    if mode:
+        q["mode"] = mode
+    if symbol:
+        q["symbol"] = symbol.upper()
+    return [clean(t) async for t in db().trades.find(q).sort("exit_time", -1).limit(limit)]
+
+
+@api.get("/orders")
+async def orders(date_: str | None = Query(None, alias="date")):
+    return [clean(o) async for o in db().orders.find({"date": date_ or today_str()}).sort("ts", -1)]
+
+
+@api.get("/pnl/intraday")
+async def pnl_intraday(date_: str | None = Query(None, alias="date")):
+    return [clean(x) async for x in db().pnl_snapshots.find({"date": date_ or today_str()}).sort("ts", 1)]
+
+
+@api.get("/pnl/daily")
+async def pnl_daily(mode: str | None = None, days: int = 90):
+    rt = await get_runtime()
+    since = (date.today() - timedelta(days=days)).isoformat()
+    agg = {}
+    async for t in db().trades.find({"mode": mode or rt["mode"], "date": {"$gte": since}}):
+        a = agg.setdefault(t["date"], {"date": t["date"], "net_pnl": 0.0, "trades": 0})
+        a["net_pnl"] = round(a["net_pnl"] + t["net_pnl"], 2)
+        a["trades"] += 1
+    return sorted(agg.values(), key=lambda x: x["date"])
+
+
+@api.get("/logs")
+async def logs(limit: int = 200):
+    return [clean(x) async for x in db().event_logs.find({}).sort("ts", -1).limit(limit)]
+
+
+# ============================================================================ settings
+@api.get("/settings/strategy")
+async def get_strategy():
+    return (await get_params()).model_dump()
+
+
+@api.put("/settings/strategy")
+async def put_strategy(p: StrategyParams):
+    v = await save_params(p)
+    await reschedule_from_params()
+    engine._prep = {}
+    await log_event("info", "settings", f"Strategy params saved (v{v})")
+    return {"version": v, "params": p.model_dump()}
+
+
+@api.post("/settings/strategy/reset")
+async def reset_strategy():
+    v = await save_params(StrategyParams(), "reset to defaults")
+    return {"version": v}
+
+
+class RuntimeIn(BaseModel):
+    mode: str | None = None
+    broker: str | None = None
+    engine_enabled: bool | None = None
+    paper_capital: float | None = None
+    confirm_live: bool = False
+
+
+@api.get("/settings/runtime")
+async def get_rt():
+    return await get_runtime()
+
+
+@api.put("/settings/runtime")
+async def put_rt(body: RuntimeIn):
+    ch = {k: v for k, v in body.model_dump().items() if v is not None and k != "confirm_live"}
+    if ch.get("mode") == "live":
+        if not body.confirm_live:
+            raise HTTPException(400, "Switching to LIVE requires confirm_live=true")
+        broker = ch.get("broker") or (await get_runtime())["broker"]
+        if not (await token_status(broker))["connected"]:
+            raise HTTPException(400, f"{broker} is not connected — login first")
+    if (await order_manager.open_positions()) and "mode" in ch:
+        raise HTTPException(400, "Close open positions before switching mode")
+    rt = await update_runtime(**ch)
+    await log_event("warning" if ch.get("mode") == "live" else "info", "settings", f"Runtime updated: {ch}")
+    return rt
+
+
+# ============================================================================ brokers
+@api.get("/broker/status")
+async def broker_status():
+    s = get_settings()
+    return {b: {**await token_status(b),
+                "api_key_configured": bool(s.upstox_api_key if b == "upstox" else s.kite_api_key)}
+            for b in ("upstox", "kite")}
+
+
+@api.get("/broker/{name}/login-url")
+async def login_url(name: str):
+    s = get_settings()
+    if name == "upstox":
+        if not s.upstox_api_key:
+            raise HTTPException(400, "UPSTOX_API_KEY not set in backend/.env")
+        return {"url": f"https://api.upstox.com/v2/login/authorization/dialog?response_type=code"
+                       f"&client_id={s.upstox_api_key}&redirect_uri={s.upstox_redirect_uri}"}
+    if name == "kite":
+        if not s.kite_api_key:
+            raise HTTPException(400, "KITE_API_KEY not set in backend/.env")
+        return {"url": f"https://kite.zerodha.com/connect/login?v=3&api_key={s.kite_api_key}"}
+    raise HTTPException(404)
+
+
+class TokenIn(BaseModel):
+    access_token: str
+
+
+@api.post("/broker/{name}/token")
+async def set_token(name: str, body: TokenIn):
+    if name not in ("upstox", "kite"):
+        raise HTTPException(404)
+    await save_token(name, body.access_token.strip())
+    return await token_status(name)
+
+
+@api.post("/broker/{name}/logout")
+async def broker_logout(name: str):
+    await clear_token(name)
+    return await token_status(name)
+
+
+@api.get("/broker/{name}/profile")
+async def broker_profile(name: str):
+    try:
+        return await get_broker(name).profile()
+    except BrokerError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@public.get("/broker/upstox/callback")
+async def upstox_callback(code: str):
+    import httpx
+    s = get_settings()
+    async with httpx.AsyncClient(timeout=20) as c:
+        r = await c.post("https://api.upstox.com/v2/login/authorization/token",
+                         data={"code": code, "client_id": s.upstox_api_key, "client_secret": s.upstox_api_secret,
+                               "redirect_uri": s.upstox_redirect_uri, "grant_type": "authorization_code"},
+                         headers={"Accept": "application/json"})
+    js = r.json()
+    if r.status_code >= 400 or "access_token" not in js:
+        return RedirectResponse(f"{s.frontend_url}/broker?error={str(js)[:200]}")
+    await save_token("upstox", js["access_token"], {"user_name": js.get("user_name"), "user_id": js.get("user_id")})
+    await log_event("info", "broker", f"Upstox connected ({js.get('user_name')})")
+    return RedirectResponse(f"{s.frontend_url}/broker?connected=upstox")
+
+
+@public.get("/broker/kite/callback")
+async def kite_callback(request_token: str, status: str = "success"):
+    from kiteconnect import KiteConnect
+    s = get_settings()
+    try:
+        k = KiteConnect(api_key=s.kite_api_key)
+        data = await asyncio.to_thread(k.generate_session, request_token, api_secret=s.kite_api_secret)
+    except Exception as e:  # noqa: BLE001
+        return RedirectResponse(f"{s.frontend_url}/broker?error={str(e)[:200]}")
+    await save_token("kite", data["access_token"], {"user_name": data.get("user_name"), "user_id": data.get("user_id")})
+    await log_event("info", "broker", f"Kite connected ({data.get('user_name')})")
+    return RedirectResponse(f"{s.frontend_url}/broker?connected=kite")
+
+
+# ============================================================================ backtest
+class BacktestIn(BaseModel):
+    start: date
+    end: date
+    capital: float = 1_000_000
+    params: StrategyParams | None = None
+    name: str = ""
+
+
+@api.post("/backtest/run")
+async def backtest_run(body: BacktestIn):
+    if body.end < body.start:
+        raise HTTPException(400, "end < start")
+    p = body.params or await get_params()
+    doc = {"name": body.name or f"{body.start}→{body.end}", "start": body.start.isoformat(), "end": body.end.isoformat(),
+           "capital": body.capital, "params": p.model_dump(), "status": "QUEUED", "progress": 0,
+           "data_provider": market_data.provider.name, "created_at": datetime.now(timezone.utc)}
+    ins = await db().backtest_runs.insert_one(doc)
+    rid = str(ins.inserted_id)
+    asyncio.create_task(run_backtest(rid, p, body.start, body.end, body.capital))
+    return {"run_id": rid}
+
+
+@api.get("/backtest")
+async def backtest_list():
+    return [clean(x) async for x in db().backtest_runs.find({}, {"days": 0, "params": 0, "traceback": 0,
+                                                                 "metrics.equity_curve": 0, "metrics.by_symbol": 0,
+                                                                 "metrics.by_exit_reason": 0}).sort("created_at", -1).limit(50)]
+
+
+@api.get("/backtest/{rid}")
+async def backtest_get(rid: str):
+    d = await db().backtest_runs.find_one({"_id": ObjectId(rid)})
+    if not d:
+        raise HTTPException(404)
+    return clean(d)
+
+
+@api.get("/backtest/{rid}/trades")
+async def backtest_trades(rid: str):
+    return [clean(t) async for t in db().backtest_trades.find({"run_id": rid}).sort("entry_time", 1)]
+
+
+@api.delete("/backtest/{rid}")
+async def backtest_delete(rid: str):
+    await db().backtest_runs.delete_one({"_id": ObjectId(rid)})
+    await db().backtest_trades.delete_many({"run_id": rid})
+    return {"ok": True}
