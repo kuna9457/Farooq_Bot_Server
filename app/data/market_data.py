@@ -10,7 +10,7 @@ import pandas as pd
 
 from ..config import get_settings
 from ..db import db
-from .providers import COLS, IST, DataProvider, UpstoxProvider, YFinanceProvider, empty_df
+from .providers import COLS, IST, AngelProvider, DataProvider, UpstoxProvider, YFinanceProvider, empty_df
 from .universe import NIFTY_INDEX, get_universe
 
 log = logging.getLogger("market_data")
@@ -47,10 +47,14 @@ class MarketData:
         return self._provider
 
     def set_provider(self, name: str) -> None:
-        if name == "upstox":
+        if name == "angel" and get_settings().angel_api_key:
+            self._provider = AngelProvider()
+        elif name == "upstox":
             from ..execution.tokens import get_token
             self._provider = UpstoxProvider(lambda: get_token("upstox"), self.upstox_key)
         else:
+            if name == "angel":
+                log.warning("DATA_PROVIDER=angel but ANGEL_API_KEY is not set - falling back to yfinance")
             self._provider = YFinanceProvider()
         self._mem.clear()
         log.info("Data provider: %s", self._provider.name)

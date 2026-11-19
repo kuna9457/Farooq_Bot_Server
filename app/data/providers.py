@@ -152,3 +152,69 @@ class UpstoxProvider(DataProvider):
             if tok in keys:
                 out[keys[tok]] = float(v.get("last_price"))
         return out
+
+
+# ============================================================================ Angel One (primary: REST candles + WebSocket LTP)
+class AngelProvider(DataProvider):
+    """Angel One SmartAPI: historical candles over REST, live LTP from the SmartAPI WebSocket (REST quote fallback)."""
+    name = "angel"
+    # SmartAPI limits per request: 5-minute candles 100 days, daily candles 2000 days
+    CHUNK_5M, CHUNK_1D = 90, 1900
+
+    @staticmethod
+    def _candles(rows, daily: bool) -> pd.DataFrame:
+        if not rows:
+            return empty_df()
+        df = pd.DataFrame([r[:6] for r in rows], columns=["ts"] + COLS)
+        idx = pd.DatetimeIndex(pd.to_datetime(df.pop("ts"), utc=True)).tz_convert(IST)
+        df.index = idx.normalize() if daily else idx
+        return df.astype(float).sort_index()
+
+    async def _fetch(self, symbol: str, interval: str, start: datetime, end: datetime, daily: bool, chunk: int):
+        from ..execution import angel
+        token, _ = await angel.token_for(symbol)
+        frames, s = [], start
+        while s <= end:
+            e = min(end, s + timedelta(days=chunk))
+            rows = await angel.call("POST", "/rest/secure/angelbroking/historical/v1/getCandleData", json_body={
+                "exchange": "NSE", "symboltoken": token, "interval": interval,
+                "fromdate": s.strftime("%Y-%m-%d %H:%M"), "todate": e.strftime("%Y-%m-%d %H:%M")})
+            frames.append(self._candles(rows, daily))
+            s = e + timedelta(minutes=1)
+        df = pd.concat([f for f in frames if not f.empty]) if any(not f.empty for f in frames) else empty_df()
+        return df[~df.index.duplicated(keep="last")].sort_index()
+
+    async def daily(self, symbol, start, end):
+        return await self._fetch(symbol, "ONE_DAY", datetime.combine(start, datetime.min.time()),
+                                 datetime.combine(end, datetime.min.time()).replace(hour=15, minute=30),
+                                 True, self.CHUNK_1D)
+
+    async def intraday_5m(self, symbol, start, end):
+        df = await self._fetch(symbol, "FIVE_MINUTE", datetime.combine(start, datetime.min.time()).replace(hour=9, minute=15),
+                               datetime.combine(end, datetime.min.time()).replace(hour=15, minute=30), False, self.CHUNK_5M)
+        if df.empty:
+            return df
+        t = df.index.time  # regular session only
+        return df[(t >= datetime.strptime("09:15", "%H:%M").time()) & (t < datetime.strptime("15:30", "%H:%M").time())]
+
+    async def ltp(self, symbols):
+        from ..execution import angel
+        out: dict[str, float] = {}
+        try:
+            await angel.feed_ws.ensure(symbols)
+            for s in symbols:
+                p = angel.feed_ws.fresh(s)
+                if p is not None:
+                    out[s] = p
+        except Exception as e:  # noqa: BLE001
+            log.warning("Angel WebSocket unavailable: %s", e)
+        missing = [s for s in symbols if s not in out]
+        if missing:  # REST fallback (first ticks / socket down)
+            tokens = {(await angel.token_for(s))[0]: s for s in missing}
+            data = await angel.call("POST", "/rest/secure/angelbroking/market/v1/quote/",
+                                    json_body={"mode": "LTP", "exchangeTokens": {"NSE": list(tokens)}})
+            for q in (data or {}).get("fetched", []):
+                sym = tokens.get(str(q.get("symbolToken")))
+                if sym and q.get("ltp") is not None:
+                    out[sym] = float(q["ltp"])
+        return out

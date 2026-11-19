@@ -32,9 +32,16 @@ Browser ──► Vercel (React dashboard)  ──REST + WebSocket──►  Ren
 3. Open the Vercel URL and log in. `vercel.json` already handles page refreshes on routes like `/charts`.
 4. Go back to Render and make sure `FRONTEND_URL` / `CORS_ORIGINS` match the Vercel URL exactly (custom domain too, if you add one).
 
-## 4. Keep it in paper mode
+## 4. Angel One SmartAPI (primary broker)
+1. Create an app at https://smartapi.angelone.in/ → **My Apps**. **Redirect URL:** `https://<service>.onrender.com/api/broker/angel/callback`
+2. Set on Render only the app-level values: `ANGEL_API_KEY` and `DATA_PROVIDER=angel`.
+3. The user logs in themselves: dashboard → **Broker → Angel One** → enter **client code, PIN and TOTP secret** (or a one-time 6-digit code).
+   With the TOTP secret and *Remember* ticked, the bot logs in by itself every day (PIN + secret are stored encrypted in MongoDB; **Forget saved credentials** removes them).
+4. The card should then show *Live WebSocket feed: connected*.
+
+## 5. Keep it in paper mode
 Default is paper trading. Don't add Upstox/Kite keys until the client has tested. When you do:
-- Upstox/Kite redirect URL = `https://<service>.onrender.com/api/broker/upstox/callback` (or `/kite/callback`), also set `UPSTOX_REDIRECT_URI`.
+- Angel One may require your server's static IP to be registered for order APIs. Upstox/Kite redirect URL = `https://<service>.onrender.com/api/broker/upstox/callback` (or `/kite/callback`), also set `UPSTOX_REDIRECT_URI`.
 - Indian brokers require a **static IP** for order APIs; Render's outbound IPs are shared, so for live trading move the backend to an India VPS with a fixed IP (same Docker image).
 
 ## Notes

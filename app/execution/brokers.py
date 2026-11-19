@@ -191,8 +191,72 @@ class KiteBroker(BrokerAdapter):
         return await asyncio.to_thread(k.profile)
 
 
+# ================================================================== ANGEL ONE
+class AngelBroker(BrokerAdapter):
+    name = "angel"
+
+    async def place_order(self, symbol, side, qty, *, ltp=None, tag=""):
+        from . import angel
+        try:
+            token, tsym = await angel.token_for(symbol)
+            data = await angel.call("POST", "/rest/secure/angelbroking/order/v1/placeOrder", json_body={
+                "variety": "NORMAL", "tradingsymbol": tsym, "symboltoken": token, "transactiontype": side,
+                "exchange": "NSE", "ordertype": "MARKET", "producttype": "INTRADAY", "duration": "DAY",
+                "price": "0", "squareoff": "0", "stoploss": "0", "quantity": str(int(qty)),
+                "ordertag": (tag or "wwalgo")[:20]})
+        except angel.AngelError as e:
+            raise BrokerError(str(e)) from e
+        oid = (data or {}).get("orderid")
+        if not oid:
+            raise BrokerError(f"Angel One returned no order id: {data}")
+        avg = None
+        for _ in range(6):
+            await asyncio.sleep(0.7)
+            try:
+                book = await angel.call("GET", "/rest/secure/angelbroking/order/v1/getOrderBook") or []
+            except angel.AngelError:
+                continue
+            o = next((x for x in book if str(x.get("orderid")) == str(oid)), None)
+            if not o:
+                continue
+            st = str(o.get("orderstatus") or o.get("status") or "").lower()
+            if st == "complete":
+                avg = float(o.get("averageprice") or ltp or 0) or ltp
+                break
+            if st in ("rejected", "cancelled"):
+                raise BrokerError(f"Angel order {oid} {st}: {o.get('text')}")
+        return {"order_id": oid, "status": "COMPLETE" if avg else "OPEN", "avg_price": avg or ltp}
+
+    async def funds(self):
+        from . import angel
+        try:
+            d = await angel.call("GET", "/rest/secure/angelbroking/user/v1/getRMS") or {}
+        except angel.AngelError as e:
+            raise BrokerError(str(e)) from e
+        avail = float(d.get("availablecash") or 0)
+        used = float(d.get("utilisedamount") or d.get("utiliseddebits") or 0)
+        return {"available": avail, "used": used, "total": float(d.get("net") or avail + used), "raw": d}
+
+    async def positions(self):
+        from . import angel
+        return await angel.call("GET", "/rest/secure/angelbroking/order/v1/getPosition") or []
+
+    async def orders(self):
+        from . import angel
+        return await angel.call("GET", "/rest/secure/angelbroking/order/v1/getOrderBook") or []
+
+    async def profile(self):
+        from . import angel
+        try:
+            return await angel.call("GET", "/rest/secure/angelbroking/user/v1/getProfile") or {}
+        except angel.AngelError as e:
+            raise BrokerError(str(e)) from e
+
+
 def get_broker(name: str) -> BrokerAdapter:
     from ..data.market_data import market_data
+    if name == "angel":
+        return AngelBroker()
     if name == "upstox":
         return UpstoxBroker(market_data.upstox_key)
     if name == "kite":

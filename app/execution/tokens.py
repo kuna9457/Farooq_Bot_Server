@@ -15,10 +15,21 @@ def _fernet() -> Fernet:
     return Fernet(key.encode())
 
 
+def enc(text: str) -> str:
+    return _fernet().encrypt(text.encode()).decode()
+
+
+def dec(text: str) -> str:
+    try:
+        return _fernet().decrypt(text.encode()).decode()
+    except InvalidToken:
+        return ""
+
+
 def _next_expiry(broker: str) -> datetime:
-    """Next expiry in UTC: Upstox 03:30 IST (22:00 UTC), Kite 06:00 IST (00:30 UTC)."""
+    """Next expiry in UTC: Upstox 03:30 IST (22:00 UTC), Kite 06:00 IST (00:30 UTC), Angel One 05:00 IST (23:30 UTC)."""
     now = datetime.now(timezone.utc)
-    h, m = (22, 0) if broker == "upstox" else (0, 30)
+    h, m = {"upstox": (22, 0), "angel": (23, 30)}.get(broker, (0, 30))
     exp = now.replace(hour=h, minute=m, second=0, microsecond=0)
     if exp <= now:
         exp += timedelta(days=1)
@@ -46,7 +57,7 @@ async def get_token(broker: str) -> str | None:
                 return _fernet().decrypt(doc["access_token_enc"].encode()).decode()
             except InvalidToken:
                 pass
-    fallback = s.upstox_access_token if broker == "upstox" else s.kite_access_token
+    fallback = {"upstox": s.upstox_access_token, "kite": s.kite_access_token}.get(broker, "")
     return fallback or None
 
 
@@ -58,4 +69,4 @@ async def token_status(broker: str) -> dict:
 
 
 async def clear_token(broker: str) -> None:
-    await db().broker_accounts.update_one({"broker": broker}, {"$unset": {"access_token_enc": ""}})
+    await db().broker_accounts.update_one({"broker": broker}, {"$unset": {"access_token_enc": "", "feed_token_enc": "", "refresh_token_enc": ""}})

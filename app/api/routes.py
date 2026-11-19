@@ -34,7 +34,7 @@ async def status():
     return {"runtime": rt, "mock_db": dbmod.using_mock, "data_provider": market_data.provider.name,
             "market_open": market_open_now(), "now_ist": now_ist().isoformat(), "engine": engine.status,
             "jobs": jobs_info(),
-            "brokers": {b: await token_status(b) for b in ("upstox", "kite")}}
+            "brokers": {b: await token_status(b) for b in ("angel", "upstox", "kite")}}
 
 
 @api.get("/session")
@@ -111,7 +111,7 @@ async def account_summary():
     rt = await get_runtime()
     out = {"mode": rt["mode"], "execution_broker": rt["broker"] if rt["mode"] == "live" else "paper",
            "paper": await PaperBroker().funds(), "brokers": {}, "day_pnl": await order_manager.day_pnl()}
-    for b in ("upstox", "kite"):
+    for b in ("angel", "upstox", "kite"):
         st = await token_status(b)
         if st["connected"]:
             try:
@@ -254,14 +254,24 @@ async def put_rt(body: RuntimeIn):
 @api.get("/broker/status")
 async def broker_status():
     s = get_settings()
-    return {b: {**await token_status(b),
-                "api_key_configured": bool(s.upstox_api_key if b == "upstox" else s.kite_api_key)}
-            for b in ("upstox", "kite")}
+    keys = {"angel": s.angel_api_key, "upstox": s.upstox_api_key, "kite": s.kite_api_key}
+    out = {b: {**await token_status(b), "api_key_configured": bool(keys[b])} for b in ("angel", "upstox", "kite")}
+    from ..execution import angel as _angel
+    c = await _angel.creds()
+    out["angel"]["auto_login"] = bool(s.angel_api_key and c)
+    out["angel"]["saved_client_code"] = c["client_code"] if c else None
+    out["angel"]["creds_source"] = c["source"] if c else None
+    out["angel"]["websocket"] = _angel.feed_ws.connected
+    return out
 
 
 @api.get("/broker/{name}/login-url")
 async def login_url(name: str):
     s = get_settings()
+    if name == "angel":
+        if not s.angel_api_key:
+            raise HTTPException(400, "ANGEL_API_KEY not set")
+        return {"url": f"https://smartapi.angelone.in/publisher-login?api_key={s.angel_api_key}"}
     if name == "upstox":
         if not s.upstox_api_key:
             raise HTTPException(400, "UPSTOX_API_KEY not set in backend/.env")
@@ -280,10 +290,67 @@ class TokenIn(BaseModel):
 
 @api.post("/broker/{name}/token")
 async def set_token(name: str, body: TokenIn):
-    if name not in ("upstox", "kite"):
+    if name not in ("angel", "upstox", "kite"):
         raise HTTPException(404)
-    await save_token(name, body.access_token.strip())
+    if name == "angel":
+        from ..execution import angel as _angel
+        await _angel.store_session(body.access_token.strip(), "", "", get_settings().angel_client_code)
+    else:
+        await save_token(name, body.access_token.strip())
     return await token_status(name)
+
+
+class AngelLoginIn(BaseModel):
+    client_code: str
+    pin: str
+    totp: str = ""            # current 6-digit code from the authenticator app (one-time login) ...
+    totp_secret: str = ""     # ... or the TOTP secret (base32) -> enables automatic daily login
+    remember: bool = True     # store PIN + TOTP secret (encrypted) so the bot can log in by itself each day
+
+
+@api.post("/broker/angel/login")
+async def angel_login(body: AngelLoginIn):
+    """The user enters their own Angel One client code, PIN and TOTP here; nothing is read from server config."""
+    from ..execution import angel as _angel
+    cc, pin = body.client_code.strip().upper(), body.pin.strip()
+    secret, code = body.totp_secret.replace(" ", "").strip(), body.totp.strip()
+    if not cc or not pin:
+        raise HTTPException(400, "Client code and PIN are required")
+    if secret:
+        try:
+            code = _angel.totp_now(secret)
+        except Exception:  # noqa: BLE001
+            raise HTTPException(400, "TOTP secret is not valid (expected the base32 text shown next to the QR code)") from None
+    if not code:
+        raise HTTPException(400, "Enter the 6-digit TOTP code or your TOTP secret")
+    try:
+        await _angel.login_totp(cc, pin, code)
+    except _angel.AngelError as e:
+        raise HTTPException(400, str(e)) from e
+    if secret and body.remember:
+        await _angel.save_creds(cc, pin, secret)
+    await log_event("info", "broker", f"Angel One connected ({cc}, {'auto-login saved' if secret and body.remember else 'one-time'})")
+    return await token_status("angel")
+
+
+@api.post("/broker/angel/auto-login")
+async def angel_auto_login():
+    """Log in again with the credentials the user saved earlier (no typing)."""
+    from ..execution import angel as _angel
+    try:
+        await _angel.login_totp()
+    except _angel.AngelError as e:
+        raise HTTPException(400, str(e)) from e
+    await log_event("info", "broker", "Angel One connected (saved credentials)")
+    return await token_status("angel")
+
+
+@api.post("/broker/angel/forget")
+async def angel_forget():
+    from ..execution import angel as _angel
+    await _angel.forget_creds()
+    await clear_token("angel")
+    return await token_status("angel")
 
 
 @api.post("/broker/{name}/logout")
@@ -298,6 +365,18 @@ async def broker_profile(name: str):
         return await get_broker(name).profile()
     except BrokerError as e:
         raise HTTPException(400, str(e)) from e
+
+
+@public.get("/broker/angel/callback")
+async def angel_callback(auth_token: str = "", feed_token: str = "", refresh_token: str = ""):
+    """Redirect URL for the SmartAPI app (Publisher login): Angel appends auth_token, feed_token, refresh_token."""
+    from ..execution import angel as _angel
+    s = get_settings()
+    if not auth_token:
+        return RedirectResponse(f"{s.frontend_url}/broker?error=Angel One login was not completed")
+    await _angel.store_session(auth_token, feed_token, refresh_token, s.angel_client_code)
+    await log_event("info", "broker", "Angel One connected (publisher login)")
+    return RedirectResponse(f"{s.frontend_url}/broker?connected=angel")
 
 
 @public.get("/broker/upstox/callback")

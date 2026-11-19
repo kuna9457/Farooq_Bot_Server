@@ -21,8 +21,18 @@ class Settings(BaseSettings):
     allow_mock_db: bool = True        # fall back to in-memory mongomock if Mongo is unreachable
 
     # --- market data ---
-    data_provider: str = "yfinance"   # "upstox" | "yfinance"
+    data_provider: str = "angel"      # "angel" | "upstox" | "yfinance"  (angel falls back to yfinance if ANGEL_API_KEY is unset)
     ltp_poll_seconds: float = 3.0
+
+    # --- Angel One SmartAPI (primary) ---
+    angel_api_key: str = ""
+    angel_client_code: str = ""       # your Angel One login ID, e.g. A123456
+    angel_pin: str = ""               # trading PIN
+    angel_totp_secret: str = ""       # base32 secret shown when enabling TOTP -> fully automatic daily login
+    angel_base_url: str = "https://apiconnect.angelone.in"
+    angel_local_ip: str = "127.0.0.1"
+    angel_public_ip: str = "127.0.0.1"
+    angel_mac: str = "00:00:00:00:00:00"
 
     # --- Upstox ---
     upstox_api_key: str = ""

@@ -6,7 +6,7 @@ from ..strategy.params import StrategyParams
 
 RUNTIME_DEFAULTS = {
     "mode": "paper",              # paper | live
-    "broker": "upstox",           # execution broker when mode == live: upstox | kite
+    "broker": "angel",            # execution broker when mode == live: angel | upstox | kite
     "engine_enabled": True,       # auto-trading on/off
     "paper_capital": 1_000_000.0,
     "halted_date": None,          # kill switch / daily loss limit -> no more entries today

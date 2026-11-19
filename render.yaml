@@ -25,7 +25,9 @@ services:
       - key: ALLOW_MOCK_DB
         value: "false"
       - key: DATA_PROVIDER
-        value: yfinance
+        value: angel
+      - key: ANGEL_API_KEY
+        sync: false
       - key: ENABLE_SCHEDULER
         value: "true"
       - key: FRONTEND_URL
