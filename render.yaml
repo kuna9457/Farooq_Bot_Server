@@ -1,7 +1,7 @@
 # Render Blueprint - backend only (frontend is on Vercel). Mongo is MongoDB Atlas.
 services:
   - type: web
-    name: farooq-bot-api
+    name: welthwest-algo-api
     runtime: docker
     dockerfilePath: ./Dockerfile
     dockerContext: .
@@ -33,7 +33,7 @@ services:
       - key: CORS_ORIGINS
         sync: false           # same Vercel URL (comma separated if more than one)
       - key: UPSTOX_REDIRECT_URI
-        sync: false           # https://farooq-bot-api.onrender.com/api/broker/upstox/callback
+        sync: false           # https://welthwest-algo-api.onrender.com/api/broker/upstox/callback
       - key: UPSTOX_API_KEY
         sync: false
       - key: UPSTOX_API_SECRET

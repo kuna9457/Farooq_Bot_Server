@@ -20,7 +20,7 @@ Browser ──► Vercel (React dashboard)  ──REST + WebSocket──►  Ren
 | `JWT_SECRET` | long random string (Blueprint generates one) |
 | `MONGO_URI` | Atlas string from step 1 |
 | `ALLOW_MOCK_DB` | `false` |
-| `FRONTEND_URL` | your Vercel URL, e.g. `https://farooq-bot.vercel.app` (no trailing slash) |
+| `FRONTEND_URL` | your Vercel URL, e.g. `https://welthwest-algo.vercel.app` (no trailing slash) |
 | `CORS_ORIGINS` | same Vercel URL |
 | `TZ` | `Asia/Kolkata` |
 

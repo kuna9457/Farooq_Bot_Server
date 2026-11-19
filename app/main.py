@@ -33,7 +33,7 @@ async def lifespan(app: FastAPI):
         scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Farooq Trading Bot", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="WelthWest Algo", version="1.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=get_settings().cors_list, allow_credentials=True,
                    allow_methods=["*"], allow_headers=["*"])
 app.include_router(auth.router)
