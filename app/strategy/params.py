@@ -17,6 +17,7 @@ class VPParams(BaseModel):
 class RibbonParams(BaseModel):
     lengths: list[int] = Field(default_factory=lambda: [20, 50, 100, 200])
     kind: Literal["SMA", "EMA", "WMA", "RMA"] = "SMA"
+    source: Literal["open", "high", "low", "close", "hl2", "hlc3", "ohlc4"] = "close"   # price the MAs are calculated on
 
 
 class ScanParams(BaseModel):
@@ -46,6 +47,8 @@ class Filter2Params(BaseModel):
     enabled: bool = True
     ce: CEParams = Field(default_factory=CEParams)
     ribbon: RibbonParams = Field(default_factory=RibbonParams)
+    # candle values that must ALL be beyond the ribbon (above upper band for BUY / below lower band for SELL)
+    candle_fields: list[Literal["open", "high", "low", "close"]] = Field(default_factory=lambda: ["open", "close"])
     setup_requires_fresh_signal: bool = False  # True: CE buy *signal* must print on the setup candle; False: CE BUY state
     setup_lookback_days: int = 10              # how old the setup candle may be
     use_heikin_ashi: bool = True

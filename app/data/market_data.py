@@ -46,15 +46,27 @@ class MarketData:
             self.set_provider(get_settings().data_provider)
         return self._provider
 
+    @staticmethod
+    def resolve_provider_name(name: str) -> str:
+        """Requested provider, or yfinance when that broker's API key is not configured."""
+        s = get_settings()
+        name = (name or "yfinance").lower()
+        if name == "angel" and not s.angel_api_key:
+            return "yfinance"
+        if name == "upstox" and not (s.upstox_api_key or s.upstox_access_token):
+            return "yfinance"
+        return name if name in ("angel", "upstox") else "yfinance"
+
     def set_provider(self, name: str) -> None:
-        if name == "angel" and get_settings().angel_api_key:
+        resolved = self.resolve_provider_name(name)
+        if resolved != (name or "").lower() and (name or "").lower() in ("angel", "upstox"):
+            log.warning("DATA_PROVIDER=%s but its API key is not set - using yfinance", name)
+        if resolved == "angel":
             self._provider = AngelProvider()
-        elif name == "upstox":
+        elif resolved == "upstox":
             from ..execution.tokens import get_token
             self._provider = UpstoxProvider(lambda: get_token("upstox"), self.upstox_key)
         else:
-            if name == "angel":
-                log.warning("DATA_PROVIDER=angel but ANGEL_API_KEY is not set - falling back to yfinance")
             self._provider = YFinanceProvider()
         self._mem.clear()
         log.info("Data provider: %s", self._provider.name)

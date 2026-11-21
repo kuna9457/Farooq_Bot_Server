@@ -16,7 +16,9 @@ def _ma(s: pd.Series, kind: str, length: int) -> pd.Series:
 
 def ma_ribbon(df: pd.DataFrame, lengths=(20, 50, 100, 200), kind: str = "SMA", source: str = "close") -> pd.DataFrame:
     """Returns columns ma_<len> + upper (max of MAs) + lower (min of MAs). Rows where any MA is NaN have NaN bands."""
-    s = df[source].astype(float)
+    src = (source or "close").lower()
+    derived = {"hl2": ("high", "low"), "hlc3": ("high", "low", "close"), "ohlc4": ("open", "high", "low", "close")}
+    s = df[list(derived[src])].astype(float).mean(axis=1) if src in derived else df[src].astype(float)
     out = pd.DataFrame(index=df.index)
     for L in lengths:
         out[f"ma_{L}"] = _ma(s, kind, int(L))

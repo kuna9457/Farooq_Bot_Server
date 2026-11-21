@@ -119,3 +119,17 @@ def test_resample_weekly():
     w = resample(daily, "1W")
     assert len(w) == 6
     assert w["volume"].iloc[0] == 5000
+
+
+def test_ribbon_source_options():
+    import numpy as np
+    import pandas as pd
+    from app.indicators import ma_ribbon
+    n = 30
+    df = pd.DataFrame({"open": np.arange(n) + 1.0, "high": np.arange(n) + 3.0, "low": np.arange(n) + 0.0,
+                       "close": np.arange(n) + 2.0, "volume": 1.0})
+    base = ma_ribbon(df, (5,), "SMA", "close")["ma_5"].iloc[-1]
+    assert ma_ribbon(df, (5,), "SMA", "high")["ma_5"].iloc[-1] == base + 1
+    assert ma_ribbon(df, (5,), "SMA", "open")["ma_5"].iloc[-1] == base - 1
+    assert ma_ribbon(df, (5,), "SMA", "hl2")["ma_5"].iloc[-1] == base - 0.5
+    assert ma_ribbon(df, (5,), "SMA", "ohlc4")["ma_5"].iloc[-1] == base - 0.5

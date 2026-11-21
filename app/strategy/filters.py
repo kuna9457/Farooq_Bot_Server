@@ -169,12 +169,13 @@ def filter1(daily: pd.DataFrame, side: Side, p: Filter1Params) -> FilterResult:
 # --------------------------------------------------------------------------------------------- filter 2
 def filter2_setup(daily_completed: pd.DataFrame, side: Side, p: Filter2Params) -> dict | None:
     """Find the most recent setup candle among COMPLETED daily bars.
-    BUY setup: CE in BUY (or fresh buy signal) AND candle open & close above upper ribbon."""
+    BUY setup: CE in BUY (or fresh buy signal) AND selected candle values (default open & close) above upper ribbon."""
     if len(daily_completed) < max(p.ribbon.lengths) + 2:
         return None
     chart = heikin_ashi(daily_completed) if p.use_heikin_ashi else daily_completed
     ce = chandelier_exit(chart, p.ce.length, p.ce.mult, p.ce.use_close)
-    rib = ma_ribbon(chart, p.ribbon.lengths, p.ribbon.kind)
+    rib = ma_ribbon(chart, p.ribbon.lengths, p.ribbon.kind, p.ribbon.source)
+    fields = p.candle_fields or ['open', 'close']
     lookback = max(1, p.setup_lookback_days)
     n = len(chart)
     for i in range(n - 1, max(n - 1 - lookback, -1), -1):
@@ -182,11 +183,11 @@ def filter2_setup(daily_completed: pd.DataFrame, side: Side, p: Filter2Params) -
         if side == "BUY":
             ce_ok = bool(ce["buy"].iloc[i]) if p.setup_requires_fresh_signal else ce["dir"].iloc[i] == 1
             band = rib["upper"].iloc[i]
-            rib_ok = not np.isnan(band) and row["open"] > band and row["close"] > band
+            rib_ok = not np.isnan(band) and all(row[f] > band for f in fields)
         else:
             ce_ok = bool(ce["sell"].iloc[i]) if p.setup_requires_fresh_signal else ce["dir"].iloc[i] == -1
             band = rib["lower"].iloc[i]
-            rib_ok = not np.isnan(band) and row["open"] < band and row["close"] < band
+            rib_ok = not np.isnan(band) and all(row[f] < band for f in fields)
         if ce_ok and rib_ok:
             # trigger level uses the REAL candle high/low (tradeable price), HA used for the setup decision
             real = daily_completed.iloc[i]
