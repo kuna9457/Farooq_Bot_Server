@@ -170,11 +170,11 @@ def filter1(daily: pd.DataFrame, side: Side, p: Filter1Params) -> FilterResult:
 def filter2_setup(daily_completed: pd.DataFrame, side: Side, p: Filter2Params) -> dict | None:
     """Find the most recent setup candle among COMPLETED daily bars.
     BUY setup: CE in BUY (or fresh buy signal) AND selected candle values (default open & close) above upper ribbon."""
-    if len(daily_completed) < max(p.ribbon.lengths) + 2:
+    if len(daily_completed) < max(p.ribbon.lengths, default=1) + 2:
         return None
     chart = heikin_ashi(daily_completed) if p.use_heikin_ashi else daily_completed
     ce = chandelier_exit(chart, p.ce.length, p.ce.mult, p.ce.use_close)
-    rib = ma_ribbon(chart, p.ribbon.lengths, p.ribbon.kind, p.ribbon.source)
+    rib = ma_ribbon(chart, specs=p.ribbon.mas)
     fields = p.candle_fields or ['open', 'close']
     lookback = max(1, p.setup_lookback_days)
     n = len(chart)

@@ -133,3 +133,24 @@ def test_ribbon_source_options():
     assert ma_ribbon(df, (5,), "SMA", "open")["ma_5"].iloc[-1] == base - 1
     assert ma_ribbon(df, (5,), "SMA", "hl2")["ma_5"].iloc[-1] == base - 0.5
     assert ma_ribbon(df, (5,), "SMA", "ohlc4")["ma_5"].iloc[-1] == base - 0.5
+
+
+def test_ribbon_per_ma_specs_and_migration():
+    import numpy as np
+    import pandas as pd
+    from app.indicators import ma_ribbon
+    from app.strategy.params import RibbonParams
+    n = 60
+    df = pd.DataFrame({"open": np.arange(n) + 1.0, "high": np.arange(n) + 3.0, "low": np.arange(n) + 0.0,
+                       "close": np.arange(n) + 2.0, "volume": np.arange(n) + 1.0})
+    specs = [{"enabled": True, "kind": "SMA", "source": "close", "length": 5},
+             {"enabled": True, "kind": "EMA", "source": "hlcc4", "length": 5},
+             {"enabled": False, "kind": "SMA", "source": "close", "length": 50},
+             {"enabled": True, "kind": "VWMA", "source": "volume", "length": 5}]
+    r = ma_ribbon(df, specs=specs)
+    assert [c for c in r.columns if c.startswith("ma_")] == ["ma_5", "ma_5_2", "ma_5_4"]
+    assert r["upper"].iloc[-1] == r[["ma_5", "ma_5_2", "ma_5_4"]].iloc[-1].max()
+    # old saved settings {lengths, kind, source} still load
+    old = RibbonParams.model_validate({"lengths": [10, 30], "kind": "EMA", "source": "high"})
+    assert [(m.length, m.kind, m.source) for m in old.mas] == [(10, "EMA", "high"), (30, "EMA", "high")]
+    assert RibbonParams().lengths == [20, 50, 100, 200]

@@ -64,7 +64,7 @@ async def build_chart(symbol: str, tf: str, side: str, p: StrategyParams) -> dic
         daily = daily.iloc[-400:]
         chart = heikin_ashi(daily) if p.filter2.use_heikin_ashi else daily
         ce = chandelier_exit(chart, p.filter2.ce.length, p.filter2.ce.mult, p.filter2.ce.use_close)
-        rib = ma_ribbon(chart, p.filter2.ribbon.lengths, p.filter2.ribbon.kind, p.filter2.ribbon.source)
+        rib = ma_ribbon(chart, specs=p.filter2.ribbon.mas)
         show = slice(-250, None)
         chart, ce, rib, real = chart.iloc[show], ce.iloc[show], rib.iloc[show], daily.iloc[show]
         times = _ts(chart.index)

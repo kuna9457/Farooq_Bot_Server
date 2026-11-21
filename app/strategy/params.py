@@ -1,6 +1,6 @@
 """All strategy parameters — editable from the Settings page, stored (versioned) in Mongo `strategy_config`."""
 from typing import Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class CEParams(BaseModel):
@@ -14,10 +14,37 @@ class VPParams(BaseModel):
     value_area_pct: float = 70.0
 
 
+MASource = Literal["open", "high", "low", "close", "volume", "hl2", "hlc3", "ohlc4", "hlcc4"]
+MAKind = Literal["SMA", "EMA", "SMMA", "RMA", "WMA", "VWMA"]
+
+
+class MASpec(BaseModel):
+    """One line of the TradingView "MA ribbon" indicator: on/off, type, source, length."""
+    enabled: bool = True
+    kind: MAKind = "SMA"
+    source: MASource = "close"
+    length: int = Field(default=20, ge=1, le=1000)
+
+
+def _default_mas() -> list[MASpec]:
+    return [MASpec(length=n) for n in (20, 50, 100, 200)]
+
+
 class RibbonParams(BaseModel):
-    lengths: list[int] = Field(default_factory=lambda: [20, 50, 100, 200])
-    kind: Literal["SMA", "EMA", "WMA", "RMA"] = "SMA"
-    source: Literal["open", "high", "low", "close", "hl2", "hlc3", "ohlc4"] = "close"   # price the MAs are calculated on
+    mas: list[MASpec] = Field(default_factory=_default_mas)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_old(cls, v):
+        # settings saved before per-MA options existed: {lengths, kind, source}
+        if isinstance(v, dict) and "mas" not in v and any(k in v for k in ("lengths", "kind", "source")):
+            return {"mas": [{"enabled": True, "kind": v.get("kind", "SMA"), "source": v.get("source", "close"),
+                             "length": L} for L in v.get("lengths", [20, 50, 100, 200])]}
+        return v
+
+    @property
+    def lengths(self) -> list[int]:
+        return [m.length for m in self.mas if m.enabled]
 
 
 class ScanParams(BaseModel):

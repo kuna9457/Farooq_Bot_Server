@@ -24,7 +24,7 @@ from ..data.universe import NIFTY_INDEX, get_universe, refresh_fundamentals
 from ..db import db
 from ..execution.charges import intraday_charges
 from ..strategy.evaluator import prepare_day
-from ..strategy.filters import (decide_regime, exit_signal_5m, filter1, filter2, filter3, month_extreme_flags,
+from ..strategy.filters import (_jsonable, decide_regime, exit_signal_5m, filter1, filter2, filter3, month_extreme_flags,
                                 pick_candidates, with_partial_bar)
 from ..strategy.params import StrategyParams
 
@@ -79,7 +79,7 @@ class Backtester:
                 await progress(10 + int(30 * done / max(1, len(symbols))), f"5m data {done}/{len(symbols)}")
         await asyncio.gather(*[ld(s) for s in symbols if s not in self.bars5])
 
-    def plan_days(self) -> list[tuple[date, list[dict], list[dict]]]:
+    def plan_days(self) -> list[tuple[date, list[dict], list[dict], dict]]:
         """Run the 08:30 scan for each trading day (pure, cheap)."""
         days = sorted({d for d in self.nifty5.index.date if self.start <= d <= self.end})
         out = []
@@ -97,7 +97,12 @@ class Backtester:
                 sh = self.shares.get(s)
                 rows.append({"symbol": s, "market_cap": (sh or 0) * f["last_close"], **f})
             b, sl = pick_candidates(rows, self.p.scan.top_n)
-            out.append((D, b, sl))
+            mc = lambda r: r.get("market_cap") or 0  # noqa: E731
+            hi = sorted([r for r in rows if r["month_high"]], key=mc, reverse=True)
+            lo = sorted([r for r in rows if r["month_low"]], key=mc, reverse=True)
+            info = {"scanned": len(rows), "high_count": len(hi), "low_count": len(lo),
+                    "high_symbols": [r["symbol"] for r in hi][:50], "low_symbols": [r["symbol"] for r in lo][:50]}
+            out.append((D, b, sl, info))
         return out
 
     # ------------------------------------------------------------------ simulation (sync, run in thread)
@@ -107,7 +112,7 @@ class Backtester:
         sq_t, last_entry_t = _t(r.square_off_time), _t(r.last_entry_time)
         slip = r.slippage_pct / 100
         nd = self.daily[NIFTY_INDEX]
-        for D, buys, sells in plan:
+        for D, buys, sells, info in plan:
             cut = pd.Timestamp(D, tz=IST)
             nprev = nd[nd.index < cut]
             nday = self.nifty5[self.nifty5.index.date == D]
@@ -120,8 +125,21 @@ class Backtester:
                 regime = "NO_TRADE"
             day = {"date": D.isoformat(), "nifty_change": round(change, 2), "regime": regime,
                    "buy_candidates": [x["symbol"] for x in buys], "sell_candidates": [x["symbol"] for x in sells],
-                   "trades": 0, "net_pnl": 0.0}
+                   "trades": 0, "net_pnl": 0.0, "scan": info, "stocks": []}
             self.days.append(day)
+            # one record per scanned candidate (both sides) - what the scan found and how each filter did
+            recs: dict[str, dict] = {}
+            for sd, lst in (("BUY", buys), ("SELL", sells)):
+                for rank, c in enumerate(lst, 1):
+                    recs[(sd, c["symbol"])] = {
+                        "symbol": c["symbol"], "side": sd, "rank": rank,
+                        "market_cap_cr": round((c.get("market_cap") or 0) / 1e7),
+                        "last_close": c.get("last_close"),
+                        "month_level": c.get("month_high_level") if sd == "BUY" else c.get("month_low_level"),
+                        "active": sd == regime, "note": "" if sd == regime else
+                        ("Not traded: regime is NO TRADE" if regime == "NO_TRADE" else f"Not traded: {regime} day"),
+                        "F1": None, "F2": None, "F3": None, "signal_time": None, "trades": []}
+            day["stocks"] = list(recs.values())
             if regime == "NO_TRADE":
                 continue
             cands = buys if regime == "BUY" else sells
@@ -129,17 +147,22 @@ class Backtester:
             ctx = {}
             for c in cands:
                 s = c["symbol"]
+                rec = recs[(side, s)]
                 b5 = self.bars5.get(s)
                 if b5 is None or b5.empty:
+                    rec["note"] = "No 5-minute data for this stock"
                     continue
                 before = b5[b5.index < cut].iloc[-900:]
                 today = b5[b5.index.date == D]
                 if today.empty:
+                    rec["note"] = "No 5-minute data for this day"
                     continue
                 dc = self.daily[s][self.daily[s].index < cut]
                 prep = prepare_day(dc, before, side, p)
+                rec["setup"] = _jsonable(prep["setup"]) if prep.get("setup") else None
+                rec["poc"] = _jsonable(prep["poc"]) if prep.get("poc") else None
                 ctx[s] = {"before": before, "today": today, "daily": dc, "prep": prep,
-                          "pos": None, "traded": False, "f1_logged": False}
+                          "pos": None, "traded": False, "f1_logged": False, "rec": rec}
             # time grid of the day
             grid = sorted(set().union(*[set(v["today"].index) for v in ctx.values()])) if ctx else []
             day_realized = 0.0
@@ -210,15 +233,19 @@ class Backtester:
                     f2 = filter2(v["prep"]["setup"], side, float(bar["close"]), p.filter2)
                     self._stat("F3", f3.passed)
                     self._stat("F2", f2.passed)
+                    self._note(v["rec"], "F3", f3, bar_close_t)
+                    self._note(v["rec"], "F2", f2, bar_close_t)
                     if not (f3.passed and f2.passed) and v["f1_logged"]:
                         continue
                     daily_live = with_partial_bar(v["daily"], v["today"][v["today"].index <= ts])
                     f1 = filter1(daily_live, side, p.filter1)
+                    self._note(v["rec"], "F1", f1, bar_close_t)
                     if not v["f1_logged"]:
                         self._stat("F1", f1.passed)
                         v["f1_logged"] = True
                     if f1.passed and f2.passed and f3.passed:
                         v["ce_stop"] = f3.values.get("ce_stop")
+                        v["rec"]["signal_time"] = bar_close_t.strftime("%H:%M")
                         pending.append((s, "ENTRY"))
                         open_count += 1
                 if r.daily_loss_limit > 0 and day_realized <= -r.daily_loss_limit:
@@ -229,6 +256,19 @@ class Backtester:
                     last = v["today"].iloc[-1]
                     day_realized += self._close(v, float(last["close"]), v["today"].index[-1], "End of data", day)
             day["net_pnl"] = round(day_realized, 2)
+
+    @staticmethod
+    def _note(rec: dict, key: str, f, t) -> None:
+        """Accumulate one filter's outcome over the day's evaluations (bars passed / evaluated, latest reason)."""
+        cur = rec.get(key) or {"evaluations": 0, "passes": 0, "first_pass": None}
+        cur["evaluations"] += 1
+        cur["passes"] += int(f.passed)
+        if f.passed and cur["first_pass"] is None:
+            cur["first_pass"] = t.strftime("%H:%M")
+        cur["status"], cur["reason"] = f.status, f.reason
+        cur["values"] = {k: x for k, x in _jsonable(f.values).items()
+                         if x is None or isinstance(x, (int, float, str, bool))}
+        rec[key] = cur
 
     def _stat(self, k, ok):
         self.filter_stats[k][1] += 1
@@ -249,6 +289,10 @@ class Backtester:
                             "net_pnl": round(net, 2), "exit_reason": reason,
                             "return_pct": round(sgn * (price / pos["entry_price"] - 1) * 100, 3)})
         day["trades"] += 1
+        if v.get("rec") is not None:
+            v["rec"]["trades"].append({"entry_time": pos["entry_time"].strftime("%H:%M"), "exit_time": ts.strftime("%H:%M"),
+                                       "entry_price": round(pos["entry_price"], 2), "exit_price": round(price, 2),
+                                       "net_pnl": round(net, 2), "exit_reason": reason})
         v["pos"] = None
         return net
 
@@ -313,7 +357,7 @@ async def run_backtest(run_id: str, p: StrategyParams, start: date, end: date, c
         await progress(2, "Loading data")
         await bt.load(progress)
         plan = await asyncio.to_thread(bt.plan_days)
-        need = {c["symbol"] for _, b, s in plan for c in b + s}
+        need = {c["symbol"] for _, b, s, _i in plan for c in b + s}
         await progress(12, f"{len(plan)} trading days, {len(need)} candidate stocks")
         await bt.preload_5m(need, progress)
         await progress(45, "Simulating")
